@@ -22,6 +22,7 @@ class StepStatus(StrEnum):
 class EvidenceStatus(StrEnum):
     OBSERVED = "observed"
     NOT_OBSERVED = "not_observed"
+    INCOMPLETE = "incomplete"
     NOT_COLLECTED = "not_collected"
     COLLECTION_FAILED = "collection_failed"
     UNSUPPORTED = "unsupported"

@@ -4,6 +4,6 @@ Section: net
 Priority: optional
 Architecture: amd64
 Maintainer: NetPath Sentinel Contributors
-Depends: python3 (>= 3.12), libpcap0.8
+Depends: libpcap0.8 | libpcap0.8t64, libglib2.0-0 | libglib2.0-0t64, libdbus-1-3, libgssapi-krb5-2, libxkbcommon0, libxkbcommon-x11-0, libegl1, libgl1, libfontconfig1, libfreetype6, libxcb-cursor0, libxcb-icccm4, libxcb-keysyms1, libxcb-shape0, libxcb-xkb1, libxcb-randr0, libxcb-render-util0, libxcb-image0, libxcb-xinerama0, libxcb-shm0, libxcb-sync1, libxcb-util1, libx11-xcb1
 Description: Evidence-driven TCP connectivity diagnostics
  NetPath Sentinel is a native desktop TCP diagnostic application.

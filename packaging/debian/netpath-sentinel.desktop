@@ -2,7 +2,7 @@
 Type=Application
 Name=NetPath Sentinel
 Comment=Evidence-driven TCP connectivity diagnostics
-Exec=netpath-sentinel
+Exec=/usr/bin/netpath-sentinel
 Icon=netpath-sentinel
 Terminal=false
 Categories=Network;Utility;

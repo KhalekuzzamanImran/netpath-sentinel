@@ -19,6 +19,7 @@ def packet(
         sequence=1,
         acknowledgement=1,
         payload_length=payload,
+        payload_data=b"x" * payload,
     )
 
 
@@ -31,15 +32,62 @@ def test_tracker_detects_complete_handshake_and_payload() -> None:
     tracker = TCPSessionTracker(server_port=6000)
     items = [
         packet("S"),
-        packet("SA", src_port=6000, dst_port=40000),
-        packet("A"),
-        packet("PA", payload=5),
+        packet("SA", src_port=6000, dst_port=40000).model_copy(
+            update={"sequence": 20, "acknowledgement": 2}
+        ),
+        packet("A").model_copy(update={"sequence": 2, "acknowledgement": 21}),
+        packet("PA", payload=5).model_copy(update={"sequence": 2, "acknowledgement": 21}),
     ]
     for item in items:
         tracker.ingest(item)
     assert len(tracker.sessions) == 1
     assert tracker.sessions[0].handshake == "complete"
     assert tracker.sessions[0].payload_bytes_client_to_server == 5
+
+
+def test_stream_reassembly_orders_segments_and_deduplicates() -> None:
+    tracker = TCPSessionTracker(server_port=6000)
+    later = packet("PA", payload=2).model_copy(
+        update={"sequence": 12, "payload_data": b"cd"}
+    )
+    earlier = packet("PA", payload=2).model_copy(
+        update={"sequence": 10, "payload_data": b"ab"}
+    )
+    tracker.ingest(later)
+    tracker.ingest(earlier)
+    tracker.ingest(earlier)
+    session = tracker.sessions[0]
+    assert bytes.fromhex(session.stream_client_to_server) == b"abcd"
+    assert session.out_of_order_segments == 1
+    assert session.retransmissions >= 1
+
+
+def test_tracker_does_not_confirm_handshake_with_incorrect_ack_numbers() -> None:
+    tracker = TCPSessionTracker(server_port=6000)
+    for item in (
+        packet("S").model_copy(update={"sequence": 100}),
+        packet("SA", src_port=6000, dst_port=40000).model_copy(
+            update={"sequence": 200, "acknowledgement": 999}
+        ),
+        packet("A").model_copy(update={"sequence": 101, "acknowledgement": 201}),
+    ):
+        tracker.ingest(item)
+    assert tracker.sessions[0].handshake != "complete"
+
+
+def test_stream_reassembly_handles_sequence_number_wraparound() -> None:
+    tracker = TCPSessionTracker(server_port=6000)
+    tracker.ingest(
+        packet("PA", payload=3).model_copy(
+            update={"sequence": 0xFFFFFFFE, "payload_data": b"abc"}
+        )
+    )
+    session = tracker.ingest(
+        packet("PA", payload=2).model_copy(
+            update={"sequence": 1, "payload_data": b"de"}
+        )
+    )
+    assert bytes.fromhex(session.stream_client_to_server) == b"abcde"
 
 
 def test_tracker_marks_midstream_capture() -> None:

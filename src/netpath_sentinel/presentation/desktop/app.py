@@ -1,9 +1,11 @@
 import asyncio
+import queue
+import sys
 from ipaddress import ip_address
 from pathlib import Path
 from uuid import uuid4
 
-from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -15,6 +17,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QMainWindow,
+    QMessageBox,
     QProgressBar,
     QPushButton,
     QSpinBox,
@@ -31,14 +34,16 @@ from netpath_sentinel.application.runner import DiagnosticRunner, WorkflowEvent
 from netpath_sentinel.configuration.paths import app_data_dir
 from netpath_sentinel.domain.enums import DiagnosticMode
 from netpath_sentinel.domain.models import DiagnosticConfig
+from netpath_sentinel.infrastructure.diagnostic_logging import log_exception
 from netpath_sentinel.infrastructure.host import HostInspector
 from netpath_sentinel.infrastructure.persistence import Repository
+from netpath_sentinel.infrastructure.windows_capture import windows_capture_diagnostics
 
 
 class DiagnosticWorker(QObject):
-    event_received = Signal(object)
     completed = Signal(object)
-    failed = Signal(str)
+    failed = Signal(str, object)
+    finished = Signal()
 
     def __init__(
         self,
@@ -52,6 +57,7 @@ class DiagnosticWorker(QObject):
         self.session_id = session_id
         self.config = config
         self.pcap_path = pcap_path
+        self.pending_events: queue.Queue[WorkflowEvent] = queue.Queue(maxsize=512)
         self.loop: asyncio.AbstractEventLoop | None = None
         self.cancel_event: asyncio.Event | None = None
 
@@ -63,7 +69,8 @@ class DiagnosticWorker(QObject):
             self.cancel_event = asyncio.Event()
 
             async def sink(event: WorkflowEvent) -> None:
-                self.event_received.emit(event)
+                # A slow GUI applies backpressure here instead of accumulating Qt events.
+                await asyncio.to_thread(self.pending_events.put, event)
 
             result = self.loop.run_until_complete(
                 self.runner.run(
@@ -72,10 +79,21 @@ class DiagnosticWorker(QObject):
             )
             self.completed.emit(result)
         except Exception as exc:
-            self.failed.emit(str(exc))
+            diagnostics = getattr(exc, "diagnostics", {})
+            if not isinstance(diagnostics, dict):
+                diagnostics = {}
+            log_path = log_exception("diagnostic_workflow_failed", exc, diagnostics)
+            self.failed.emit(
+                str(exc),
+                {"diagnostics": diagnostics, "log_path": str(log_path) if log_path else None},
+            )
+        except asyncio.CancelledError:
+            # The runner has already emitted its terminal cancellation workflow event.
+            pass
         finally:
             if self.loop:
                 self.loop.close()
+            self.finished.emit()
 
     def cancel(self) -> None:
         if self.loop and self.cancel_event:
@@ -91,6 +109,11 @@ class MainWindow(QMainWindow):
         self.repository = Repository(app_data_dir() / "netpath-sentinel.sqlite3")
         self.worker: DiagnosticWorker | None = None
         self.worker_thread: QThread | None = None
+        self.pending_events: queue.Queue[WorkflowEvent] | None = None
+        self.worker_status: QTextEdit | None = None
+        self.event_timer = QTimer(self)
+        self.event_timer.setInterval(20)
+        self.event_timer.timeout.connect(self._drain_worker_events)
         self.session_id: str | None = None
         self.details = self._details_page()
 
@@ -207,6 +230,25 @@ class MainWindow(QMainWindow):
                     destination_port=port.value(),
                     duration_seconds=duration.value(),
                 )
+                if config.mode != DiagnosticMode.PCAP_REPLAY and sys.platform == "win32":
+                    capture_status = windows_capture_diagnostics()
+                    if not capture_status["available"]:
+                        message = (
+                            "Windows live capture requires Npcap. "
+                            f"{capture_status['reason']}\n\n"
+                            "Install Npcap from https://npcap.com/, then restart "
+                            "NetPath Sentinel. Npcap is not included with this installer."
+                        )
+                        log_path = log_exception(
+                            "capture_preflight_failed",
+                            RuntimeError(capture_status["reason"]),
+                            capture_status,
+                        )
+                        if log_path:
+                            message += f"\nDiagnostic log: {log_path}"
+                        status.setPlainText(message)
+                        QMessageBox.warning(self, "Capture setup required", message)
+                        return
                 session_id = str(uuid4())
                 self.repository.save_session(session_id, config)
                 replay = Path(pcap.text()) if pcap.text().strip() else None
@@ -233,12 +275,48 @@ class MainWindow(QMainWindow):
         self.worker = DiagnosticWorker(
             DiagnosticRunner(self.repository), session_id, config, replay
         )
+        self.worker_status = status
+        self.pending_events = self.worker.pending_events
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
-        self.worker.event_received.connect(self.details.consume_event)
-        self.worker.completed.connect(lambda result: self.details.finish(result))
-        self.worker.failed.connect(lambda error: self.details.fail(error, status))
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker_thread.finished.connect(self.worker.deleteLater)
+        self.worker.completed.connect(self.details.finish)
+        self.worker.failed.connect(self._handle_worker_error)
+        self.event_timer.start()
         self.worker_thread.start()
+
+    @Slot(str, object)
+    def _handle_worker_error(self, error: str, context: object) -> None:
+        details = context if isinstance(context, dict) else {}
+        diagnostics = details.get("diagnostics", {})
+        category = diagnostics.get("error_category") if isinstance(diagnostics, dict) else None
+        log_path = details.get("log_path")
+        actionable = error
+        if category:
+            actionable += f"\nCapture error category: {category}."
+        actionable += (
+            f"\nDiagnostic log: {log_path}"
+            if log_path
+            else "\nA diagnostic log could not be written; check the user data directory permissions."
+        )
+        self.details.fail(actionable, self.worker_status)
+
+    @Slot()
+    def _drain_worker_events(self) -> None:
+        pending_events = self.pending_events
+        if pending_events is not None:
+            for _ in range(128):
+                try:
+                    event = pending_events.get_nowait()
+                except queue.Empty:
+                    break
+                self.details.consume_event(event)
+        if (
+            self.worker_thread is None
+            or not self.worker_thread.isRunning()
+        ) and (pending_events is None or pending_events.empty()):
+            self.event_timer.stop()
 
     def _history(self) -> QWidget:
         widget = QWidget()
@@ -295,13 +373,14 @@ class MainWindow(QMainWindow):
         )
 
     def _routes_text(self) -> str:
-        return (
-            "\n".join(
-                f"{r.destination} via {r.gateway or '-'} dev {r.interface or '-'}"
-                for r in self.inspector.snapshot().routes
-            )
-            or "No route data was available."
+        snapshot = self.inspector.snapshot()
+        routes = "\n".join(
+            f"{r.destination} via {r.gateway or '-'} dev {r.interface or '-'} metric {r.metric if r.metric is not None else '-'}"
+            for r in snapshot.routes
         )
+        if snapshot.route_error:
+            return f"{routes}\n{snapshot.route_error}" if routes else snapshot.route_error
+        return routes or "No route data was available."
 
     def _listeners_text(self) -> str:
         return (
@@ -469,10 +548,12 @@ class SessionDetails(QWidget):
                 f"[{event.finding.severity}] {event.finding.code}\n{event.finding.conclusion}\nNext: {event.finding.next_action}\n"
             )
 
+    @Slot(object)
     def finish(self, result: object) -> None:
         self.progress.setValue(100)
         self.report.setPlainText(str(result))
 
+    @Slot(str, object)
     def fail(self, error: str, status: QTextEdit | None = None) -> None:
         self.workflow.append(f"[failed] {error}")
         if status:

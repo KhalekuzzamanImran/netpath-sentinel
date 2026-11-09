@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -93,6 +94,8 @@ class Repository:
         self.engine = create_engine(f"sqlite:///{database_path}", future=True)
         self.sessions = sessionmaker(self.engine, expire_on_commit=False)
         Base.metadata.create_all(self.engine)
+        if os.name != "nt" and database_path.exists():
+            database_path.chmod(0o600)
 
     def save_session(
         self, session_id: str, config: DiagnosticConfig, status: str = "created"

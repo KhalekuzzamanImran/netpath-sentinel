@@ -26,6 +26,10 @@ class RouteInfo(BaseModel):
     gateway: str | None = None
     interface: str | None = None
     source: str | None = None
+    interface_index: int | None = None
+    address_family: str | None = None
+    route_metric: int | None = None
+    interface_metric: int | None = None
     metric: int | None = None
 
 
@@ -75,6 +79,9 @@ class PacketEvent(BaseModel):
     payload_length: int = 0
     payload_preview_hex: str | None = None
     packet_number: int | None = None
+    capture_interface: str | None = None
+    truncated: bool = False
+    payload_data: bytes = Field(default=b"", exclude=True, repr=False)
 
 
 class TCPSession(BaseModel):
@@ -91,6 +98,12 @@ class TCPSession(BaseModel):
     payload_bytes_server_to_client: int = 0
     retransmissions: int = 0
     capture_started_midstream: bool = False
+    observed_state: str = "unknown"
+    stream_client_to_server: str = ""
+    stream_server_to_client: str = ""
+    stream_incomplete: bool = False
+    duplicate_acks: int = 0
+    out_of_order_segments: int = 0
 
 
 class Evidence(BaseModel):

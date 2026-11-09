@@ -1,7 +1,10 @@
 import asyncio
+import queue
+import threading
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from ipaddress import ip_address, ip_network
 from pathlib import Path
 
 from netpath_sentinel.analysis.heartbeat import evaluate_heartbeat
@@ -16,7 +19,7 @@ from netpath_sentinel.domain.models import (
     PacketEvent,
     TCPSession,
 )
-from netpath_sentinel.infrastructure.capture import capture_live, replay_pcap
+from netpath_sentinel.infrastructure.capture import BoundedPacketQueue, capture_live, replay_pcap
 from netpath_sentinel.infrastructure.host import HostInspector, HostSnapshot
 from netpath_sentinel.infrastructure.listener import DiagnosticListener
 from netpath_sentinel.infrastructure.persistence import Repository
@@ -47,6 +50,7 @@ class DiagnosticRunner:
     def __init__(self, repository: Repository, inspector: HostInspector | None = None) -> None:
         self.repository = repository
         self.inspector = inspector or HostInspector()
+        self._active_sessions: set[str] = set()
 
     async def run(
         self,
@@ -57,8 +61,12 @@ class DiagnosticRunner:
         cancel_event: asyncio.Event | None = None,
     ) -> dict[str, object]:
         cancel_event = cancel_event or asyncio.Event()
+        if session_id in self._active_sessions:
+            raise RuntimeError("diagnostic session is already running")
+        self._active_sessions.add(session_id)
         self.repository.update_session_status(session_id, "running")
         steps: list[DiagnosticStep] = []
+        replay_packet_limit_reached = False
 
         async def emit(event: WorkflowEvent) -> None:
             if sink:
@@ -120,6 +128,7 @@ class DiagnosticRunner:
                 status=EvidenceStatus.OBSERVED,
                 observation={
                     "routes": [r.model_dump() for r in snapshot.routes],
+                    "route_error": snapshot.route_error,
                     "listeners": [listener.model_dump() for listener in snapshot.listeners],
                 },
             )
@@ -130,16 +139,38 @@ class DiagnosticRunner:
             await finish(step, StepStatus.PASSED, 20, "Route and listener inspection complete")
 
             step = await stage("capture_preparation", "Prepare packet observation", 25)
+            live_queue: BoundedPacketQueue | None = None
+            capture_task: asyncio.Task[Iterable[PacketEvent]] | None = None
+            stop_capture: threading.Event | None = None
+            capture_ready: threading.Event | None = None
+            active_listener: DiagnosticListener | None = None
             if str(config.mode) == "pcap_replay":
                 if not pcap_path or not pcap_path.exists():
                     raise FileNotFoundError("PCAP replay mode requires an existing capture file")
-                packets: Iterable[PacketEvent] = replay_pcap(pcap_path)
+                if pcap_path.stat().st_size > config.max_capture_bytes:
+                    raise ValueError("PCAP exceeds configured maximum capture size")
+                source_packets = replay_pcap(pcap_path, capture_payload=config.capture_payload)
+
+                def bounded_replay() -> Iterable[PacketEvent]:
+                    nonlocal replay_packet_limit_reached
+                    for index, packet in enumerate(source_packets):
+                        if index >= config.max_packets:
+                            replay_packet_limit_reached = True
+                            break
+                        yield packet
+
+                packets: Iterable[PacketEvent] = bounded_replay()
                 capture_source = str(pcap_path)
             else:
-                interface = config.interface or self._default_interface(snapshot.interfaces)
+                interface = config.interface or self._default_interface(
+                    snapshot.interfaces,
+                    config.destination_ip,
+                    snapshot.routes,
+                )
                 if not interface:
-                    raise RuntimeError("No capture interface is available")
-                active_listener: DiagnosticListener | None = None
+                    raise RuntimeError(
+                        "No unambiguous capture interface is available. Select an adapter explicitly."
+                    )
                 if str(config.mode) == "active_listener":
                     occupied = [
                         item
@@ -156,29 +187,38 @@ class DiagnosticRunner:
                 packet_filter = f"tcp port {config.destination_port}"
                 if config.source_ip:
                     packet_filter += f" and host {config.source_ip}"
-                try:
-                    packets = await asyncio.to_thread(
-                        capture_live,
-                        interface,
-                        config.duration_seconds,
-                        config.destination_port,
-                        config.max_packets,
-                        packet_filter,
-                    )
-                finally:
-                    if active_listener:
-                        await active_listener.stop()
+                stop_capture = threading.Event()
+                capture_ready = threading.Event()
+                live_queue = BoundedPacketQueue(capacity=512)
+                capture_task = asyncio.create_task(asyncio.to_thread(
+                    capture_live,
+                    interface,
+                    config.duration_seconds,
+                    config.destination_port,
+                    config.max_packets,
+                    packet_filter,
+                    stop_capture,
+                    live_queue,
+                    capture_ready,
+                    config.capture_payload,
+                ))
+                while not capture_ready.is_set() and not capture_task.done():
+                    if cancel_event.is_set():
+                        stop_capture.set()
+                    await asyncio.to_thread(capture_ready.wait, 0.05)
+                if capture_task.done():
+                    await capture_task
+                    if not capture_ready.is_set():
+                        raise RuntimeError("Capture backend stopped before it became ready.")
+                packets = ()
                 capture_source = f"live:{interface}"
             await finish(step, StepStatus.PASSED, 30, f"Capture ready: {capture_source}")
 
             tracker = TCPSessionTracker(server_port=config.destination_port)
             step = await stage("packet_observation", "Observe TCP packets", 35)
-            if cancel_event.is_set():
-                raise asyncio.CancelledError
             packet_count = 0
-            for packet in packets:
-                if cancel_event.is_set():
-                    raise asyncio.CancelledError
+            async def consume_packet(packet: PacketEvent) -> None:
+                nonlocal packet_count
                 packet_count += 1
                 session = tracker.ingest(packet)
                 self.repository.save_packet(packet, session.id, session_id)
@@ -195,15 +235,45 @@ class DiagnosticRunner:
                         tcp_session=session,
                     )
                 )
+            try:
+                if capture_task is not None and live_queue is not None:
+                    while not capture_task.done() or not live_queue.empty():
+                        if cancel_event.is_set() and stop_capture is not None:
+                            stop_capture.set()
+                        try:
+                            packet = await asyncio.to_thread(live_queue.get, 0.1)
+                        except queue.Empty:
+                            continue
+                        await consume_packet(packet)
+                    await capture_task
+                else:
+                    for packet in packets:
+                        await consume_packet(packet)
+            finally:
+                if stop_capture is not None:
+                    stop_capture.set()
+                if capture_task is not None and not capture_task.done():
+                    await asyncio.shield(capture_task)
+                if active_listener:
+                    await active_listener.stop()
             summary = Evidence(
                 session_id=session_id,
                 evidence_type="packet_summary",
                 source=capture_source,
-                status=EvidenceStatus.OBSERVED if packet_count else EvidenceStatus.NOT_OBSERVED,
+                status=(
+                    EvidenceStatus.INCOMPLETE
+                    if cancel_event.is_set() or replay_packet_limit_reached
+                    else EvidenceStatus.OBSERVED
+                    if packet_count
+                    else EvidenceStatus.NOT_OBSERVED
+                ),
                 observation={
                     "packets": packet_count,
                     "sessions": len(tracker.sessions),
                     "handshakes": [s.handshake for s in tracker.sessions],
+                    "internal_queue_drops": live_queue.dropped if live_queue else 0,
+                    "capture_complete": not cancel_event.is_set() and not replay_packet_limit_reached,
+                    "packet_limit_reached": replay_packet_limit_reached,
                 },
             )
             self.repository.save_evidence(summary)
@@ -212,10 +282,16 @@ class DiagnosticRunner:
                                       "Packet summary collected", evidence=summary))
             await finish(
                 step,
-                StepStatus.PASSED if packet_count else StepStatus.WARNING,
+                StepStatus.WARNING
+                if cancel_event.is_set() or replay_packet_limit_reached or not packet_count
+                else StepStatus.PASSED,
                 85,
-                f"Observed {packet_count} TCP packets",
+                f"Observed {packet_count} TCP packets"
+                + (" before cancellation" if cancel_event.is_set() else "")
+                + ("; replay stopped at configured packet limit" if replay_packet_limit_reached else ""),
             )
+            if cancel_event.is_set():
+                raise asyncio.CancelledError
 
             last_packet = tracker.sessions[-1].last_seen if tracker.sessions else None
             heartbeat = evaluate_heartbeat(
@@ -295,14 +371,65 @@ class DiagnosticRunner:
             self.repository.update_session_status(session_id, "failed")
             await emit(WorkflowEvent(session_id, "error", "workflow", "failed", 100, str(exc)))
             raise
+        finally:
+            self._active_sessions.discard(session_id)
 
     @staticmethod
-    def _default_interface(interfaces: Sequence[object]) -> str | None:
-        for item in interfaces:
-            name = str(getattr(item, "name", ""))
-            if getattr(item, "is_up", False) and name != "lo":
-                return name
-        return None
+    def _default_interface(
+        interfaces: Sequence[object],
+        destination: object | None = None,
+        routes: Sequence[object] = (),
+    ) -> str | None:
+        active = {
+            str(getattr(item, "name", "")): item
+            for item in interfaces
+            if getattr(item, "is_up", False) and getattr(item, "name", "")
+        }
+        if destination:
+            try:
+                target = ip_address(str(destination))
+            except ValueError:
+                target = None
+            if target and target.is_loopback:
+                loopbacks = [
+                    name
+                    for name in active
+                    if "loopback" in name.casefold() or name.casefold() == "lo"
+                ]
+                return loopbacks[0] if len(loopbacks) == 1 else None
+        else:
+            target = None
+
+        matching: list[tuple[int, int, str]] = []
+        for route in routes:
+            name = str(getattr(route, "interface", "") or "")
+            if name not in active:
+                continue
+            try:
+                network = ip_network(str(getattr(route, "destination", "")), strict=False)
+            except ValueError:
+                continue
+            if target and (network.version != target.version or target not in network):
+                continue
+            if target is None and network.prefixlen != 0:
+                continue
+            metric_value = getattr(route, "metric", None)
+            metric = metric_value if isinstance(metric_value, int) else 2**31 - 1
+            matching.append((network.prefixlen, metric, name))
+        if matching:
+            best_prefix = max(entry[0] for entry in matching)
+            best_metric = min(entry[1] for entry in matching if entry[0] == best_prefix)
+            choices = {
+                entry[2]
+                for entry in matching
+                if entry[0] == best_prefix and entry[1] == best_metric
+            }
+            return next(iter(choices)) if len(choices) == 1 else None
+
+        non_loopback = [
+            name for name in active if name.casefold() not in {"lo", "loopback pseudo-interface 1"}
+        ]
+        return non_loopback[0] if len(non_loopback) == 1 else None
 
     @staticmethod
     def _report_payload(
@@ -317,6 +444,8 @@ class DiagnosticRunner:
             "configuration": config.model_dump(mode="json"),
             "hostname": snapshot.hostname,
             "os": snapshot.os_version,
+            "routes": [route.model_dump(mode="json") for route in snapshot.routes],
+            "route_error": snapshot.route_error,
             "tcp_sessions": [s.model_dump(mode="json", exclude={"packets"}) for s in sessions],
             "findings": [f.model_dump(mode="json") for f in findings],
             "limitations": [

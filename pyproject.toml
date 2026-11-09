@@ -39,6 +39,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = ["windows_live: requires an installed and usable Npcap runtime"]
 
 [tool.ruff]
 line-length = 100

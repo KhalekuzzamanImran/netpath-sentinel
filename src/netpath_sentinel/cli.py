@@ -17,6 +17,7 @@ def main() -> None:
                     "os": snapshot.os_version,
                     "interfaces": [i.model_dump() for i in snapshot.interfaces],
                     "routes": [r.model_dump() for r in snapshot.routes],
+                    "route_error": snapshot.route_error,
                     "listeners": [listener.model_dump() for listener in snapshot.listeners],
                 },
                 indent=2,

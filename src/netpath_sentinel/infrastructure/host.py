@@ -15,6 +15,7 @@ class HostSnapshot:
     os_version: str
     interfaces: list[InterfaceInfo]
     routes: list[RouteInfo]
+    route_error: str | None
     listeners: list[ListenerInfo]
 
 
@@ -22,12 +23,19 @@ class HostInspector:
     """Read-only host inspection using psutil and native structured utilities."""
 
     def snapshot(self) -> HostSnapshot:
+        route_error = None
+        try:
+            routes = self.routes()
+        except (OSError, RuntimeError, NotImplementedError) as exc:
+            routes = []
+            route_error = f"{platform.system()} route discovery failed: {exc}"
         return HostSnapshot(
             hostname=socket.gethostname(),
             os_name=platform.system(),
             os_version=platform.platform(),
             interfaces=self.interfaces(),
-            routes=self.routes(),
+            routes=routes,
+            route_error=route_error,
             listeners=self.listeners(),
         )
 
@@ -57,6 +65,10 @@ class HostInspector:
         return result
 
     def routes(self) -> list[RouteInfo]:
+        if platform.system() == "Windows":
+            from netpath_sentinel.infrastructure.windows_routes import windows_routes
+
+            return windows_routes()
         if platform.system() == "Linux":
             try:
                 completed = subprocess.run(
@@ -75,9 +87,11 @@ class HostInspector:
                     )
                     for e in entries
                 ]
-            except (OSError, subprocess.SubprocessError, ValueError):
-                return []
-        return []
+            except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                raise RuntimeError(f"Linux route collection failed: {exc}") from exc
+        raise NotImplementedError(
+            f"route collection is not implemented on {platform.system()}"
+        )
 
     def listeners(self) -> list[ListenerInfo]:
         result: list[ListenerInfo] = []

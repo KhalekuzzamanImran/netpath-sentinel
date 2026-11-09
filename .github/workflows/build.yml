@@ -9,21 +9,66 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
-      - run: python -m pip install -e '.[dev]'
-      - run: pyinstaller packaging/windows/NetPathSentinel.spec --clean
+      - run: python -m pip install uv==0.13.7
+      - run: uv sync --locked --extra dev
+      - run: uv run --locked ruff check .
+      - run: uv run --locked mypy src
+      - run: uv run --locked pytest -q
+      - run: uv run --locked pyinstaller packaging/windows/NetPathSentinel.spec --clean
       - uses: Amadevus/pwsh-script@v2
         with: { script: '& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" packaging/windows/NetPathSentinel.iss' }
+      - run: uv run --locked python packaging/generate-sbom.py uv.lock dist/sbom.cdx.json
+      - run: uv run --locked python packaging/write-build-metadata.py dist/installer/NetPathSentinel-Setup-0.1.0-windows-x64.exe
       - uses: actions/upload-artifact@v4
-        with: { name: windows-installer, path: packaging/windows/Output/*.exe }
+        with:
+          name: windows-installer-and-evidence
+          path: |
+            dist/installer/*.exe
+            dist/SHA256SUMS
+            dist/build-metadata.json
+            dist/sbom.cdx.json
   linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
-      - run: python -m pip install -e '.[dev]'
-      - run: pyinstaller --name netpath-sentinel --onefile src/netpath_sentinel/main.py
-      - run: mkdir -p dist/linux && cp dist/netpath-sentinel dist/linux/
-      - run: dpkg-deb --build packaging/debian dist/netpath-sentinel_0.1.0_amd64.deb || true
+      - run: python -m pip install uv==0.13.7
+      - run: uv sync --locked --extra dev
+      - run: uv run --locked ruff check .
+      - run: uv run --locked mypy src
+      - run: uv run --locked pytest -q
+      - run: uv run --locked bash packaging/debian/build-deb.sh
+      - run: uv run --locked python packaging/generate-sbom.py uv.lock dist/sbom.cdx.json
+      - run: uv run --locked python packaging/write-build-metadata.py dist/packages/*.deb
       - uses: actions/upload-artifact@v4
-        with: { name: linux-bundle, path: dist/* }
+        with:
+          name: deb-package-and-evidence
+          path: |
+            dist/packages/*.deb
+            dist/SHA256SUMS
+            dist/build-metadata.json
+            dist/sbom.cdx.json
+  rpm:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: sudo apt-get update && sudo apt-get install -y rpm
+      - run: python -m pip install uv==0.13.7
+      - run: uv sync --locked --extra dev
+      - run: uv run --locked ruff check .
+      - run: uv run --locked mypy src
+      - run: uv run --locked pytest -q
+      - run: uv run --locked bash packaging/rpm/build-rpm.sh
+      - run: uv run --locked python packaging/generate-sbom.py uv.lock dist/sbom.cdx.json
+      - run: uv run --locked python packaging/write-build-metadata.py dist/packages/*.rpm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm-package-and-evidence
+          path: |
+            dist/packages/*.rpm
+            dist/SHA256SUMS
+            dist/build-metadata.json
+            dist/sbom.cdx.json

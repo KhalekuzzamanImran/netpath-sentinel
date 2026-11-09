@@ -75,3 +75,46 @@ async def test_replay_runner_cancellation_marks_session(tmp_path) -> None:
             "session-2", config, pcap_path=pcap, cancel_event=cancel
         )
     assert repository.list_sessions()[0].status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_replay_respects_packet_limit_and_marks_evidence_incomplete(tmp_path) -> None:
+    pcap = tmp_path / "limited.pcap"
+    packet = frame("10.1.1.2", "10.1.1.1", 41000, 6000, 0x10, 10, 0)
+    write_pcap(pcap, [packet, packet, packet])
+    repository = Repository(tmp_path / "sentinel.sqlite3")
+    config = DiagnosticConfig(
+        name="limited replay", mode="pcap_replay", destination_port=6000, max_packets=2
+    )
+    repository.save_session("limited-session", config)
+    summaries = []
+
+    async def sink(event) -> None:
+        if event.evidence and event.evidence.evidence_type == "packet_summary":
+            summaries.append(event.evidence)
+
+    await DiagnosticRunner(repository).run("limited-session", config, sink, pcap)
+    assert len(repository.session_bundle("limited-session")["packets"]) == 2
+    assert len(summaries) == 1
+    assert summaries[0].status.value == "incomplete"
+    assert summaries[0].observation["packet_limit_reached"] is True
+    assert summaries[0].observation["capture_complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_malformed_pcap_fails_workflow_with_terminal_error(tmp_path) -> None:
+    pcap = tmp_path / "malformed.pcap"
+    pcap.write_bytes(b"\xd4\xc3\xb2\xa1\x02")
+    repository = Repository(tmp_path / "sentinel.sqlite3")
+    config = DiagnosticConfig(name="malformed replay", mode="pcap_replay", destination_port=6000)
+    repository.save_session("malformed-session", config)
+    events = []
+
+    async def sink(event) -> None:
+        events.append(event)
+
+    with pytest.raises(ValueError, match="invalid PCAP global header"):
+        await DiagnosticRunner(repository).run("malformed-session", config, sink, pcap)
+    assert repository.list_sessions()[0].status == "failed"
+    assert events[-1].event_type == "error"
+    assert events[-1].status == "failed"
