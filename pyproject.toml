@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netpath-sentinel"
+version = "0.1.0"
+description = "Evidence-driven TCP connectivity diagnostics and monitoring desktop application"
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+license = { text = "MIT" }
+authors = [{ name = "NetPath Sentinel Contributors" }]
+dependencies = [
+  "pydantic>=2.8,<3",
+  "psutil>=6.0,<7",
+  "SQLAlchemy>=2.0.36,<2.1",
+  "alembic>=1.14,<2",
+  "scapy>=2.6,<3",
+  "PySide6_Essentials>=6.8,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.24,<1",
+  "pytest-qt>=4.4,<5",
+  "ruff>=0.8,<1",
+  "mypy>=1.13,<2",
+  "build>=1.2,<2",
+  "pyinstaller>=6.11,<7",
+]
+
+[project.scripts]
+netpath-sentinel = "netpath_sentinel.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501", "E701", "E702", "E741"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+ignore_missing_imports = true
+packages = ["netpath_sentinel"]

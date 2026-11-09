@@ -1,0 +1,9 @@
+Package: netpath-sentinel
+Version: 0.1.0
+Section: net
+Priority: optional
+Architecture: amd64
+Maintainer: NetPath Sentinel Contributors
+Depends: python3 (>= 3.12), libpcap0.8
+Description: Evidence-driven TCP connectivity diagnostics
+ NetPath Sentinel is a native desktop TCP diagnostic application.

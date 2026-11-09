@@ -1,0 +1,29 @@
+name: native-builds
+on:
+  push:
+    tags: ['v*']
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: python -m pip install -e '.[dev]'
+      - run: pyinstaller packaging/windows/NetPathSentinel.spec --clean
+      - uses: Amadevus/pwsh-script@v2
+        with: { script: '& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" packaging/windows/NetPathSentinel.iss' }
+      - uses: actions/upload-artifact@v4
+        with: { name: windows-installer, path: packaging/windows/Output/*.exe }
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: python -m pip install -e '.[dev]'
+      - run: pyinstaller --name netpath-sentinel --onefile src/netpath_sentinel/main.py
+      - run: mkdir -p dist/linux && cp dist/netpath-sentinel dist/linux/
+      - run: dpkg-deb --build packaging/debian dist/netpath-sentinel_0.1.0_amd64.deb || true
+      - uses: actions/upload-artifact@v4
+        with: { name: linux-bundle, path: dist/* }
