@@ -1,8 +1,11 @@
 import os
+import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
+from netpath_sentinel import __version__
 from netpath_sentinel.configuration.paths import app_data_dir
 
 ROOT = Path(__file__).parents[2]
@@ -63,3 +66,23 @@ def test_application_data_directory_override_is_created(tmp_path, monkeypatch) -
     assert target.is_dir()
     if os.name != "nt":
         assert target.stat().st_mode & 0o777 == 0o700
+
+
+def test_gui_cli_and_windows_installer_share_project_version() -> None:
+    project_version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
+    installer = (ROOT / "packaging/windows/NetPathSentinel.iss").read_text()
+    metadata = (ROOT / "packaging/windows/version_info.txt").read_text()
+    match = re.search(r"#define AppVersion \"([^\"]+)\"", installer)
+    assert project_version == __version__
+    assert match and match.group(1) == project_version
+    assert f"FileVersion', '{project_version}'" in metadata
+    assert f"ProductVersion', '{project_version}'" in metadata
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "packaging/gui_main.py"), "--cli", "--version"],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0
+    assert project_version in result.stdout

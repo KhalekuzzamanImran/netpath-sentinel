@@ -175,7 +175,7 @@ class Repository:
                     for item in db.query(StoredStep).filter_by(session_id=session_id).all()
                 ],
                 "packets": [
-                    item.payload
+                    {**item.payload, "tcp_session_id": item.tcp_session_id}
                     for item in db.query(StoredPacket).filter_by(session_id=session_id).all()
                 ],
                 "tcp_sessions": [
@@ -185,6 +185,14 @@ class Repository:
                 "findings": [
                     item.payload
                     for item in db.query(StoredFinding).filter_by(session_id=session_id).all()
+                ],
+                "reports": [
+                    {
+                        "html_path": item.html_path,
+                        "json_path": item.json_path,
+                        "created_at": str(item.created_at),
+                    }
+                    for item in db.query(StoredReport).filter_by(session_id=session_id).all()
                 ],
             }
 

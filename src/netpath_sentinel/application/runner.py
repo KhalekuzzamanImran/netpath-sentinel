@@ -10,7 +10,7 @@ from pathlib import Path
 from netpath_sentinel.analysis.heartbeat import evaluate_heartbeat
 from netpath_sentinel.analysis.rca import analyze
 from netpath_sentinel.analysis.tcp import TCPSessionTracker
-from netpath_sentinel.domain.enums import EvidenceStatus, StepStatus
+from netpath_sentinel.domain.enums import Confidence, EvidenceStatus, StepStatus
 from netpath_sentinel.domain.models import (
     DiagnosticConfig,
     DiagnosticStep,
@@ -39,6 +39,7 @@ class WorkflowEvent:
     evidence: Evidence | None = None
     finding: Finding | None = None
     timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
+    step: DiagnosticStep | None = None
 
 
 EventSink = Callable[[WorkflowEvent], Awaitable[None] | None]
@@ -66,6 +67,8 @@ class DiagnosticRunner:
         self._active_sessions.add(session_id)
         self.repository.update_session_status(session_id, "running")
         steps: list[DiagnosticStep] = []
+        collected_evidence: list[Evidence] = []
+        active_step: DiagnosticStep | None = None
         replay_packet_limit_reached = False
 
         async def emit(event: WorkflowEvent) -> None:
@@ -74,28 +77,77 @@ class DiagnosticRunner:
                 if asyncio.iscoroutine(result):
                     await result
 
+        purposes = {
+            "host_discovery": "Collect the local host identity and available network adapters.",
+            "route_inspection": "Inspect local routes and listening TCP sockets.",
+            "capture_preparation": "Validate the selected capture source and wait for readiness.",
+            "packet_observation": "Observe matching TCP traffic for this diagnostic window.",
+            "heartbeat": "Compare observed activity with the configured heartbeat expectation.",
+            "rca": "Correlate captured evidence without attributing an unobserved cause.",
+        }
+
         async def stage(stage_id: str, name: str, progress: int) -> DiagnosticStep:
+            nonlocal active_step
             step = DiagnosticStep(
                 session_id=session_id,
                 step_id=stage_id,
                 name=name,
                 status=StepStatus.RUNNING,
+                purpose=purposes.get(stage_id, name),
                 started_at=datetime.now(UTC),
             )
             steps.append(step)
+            active_step = step
             self.repository.save_step(step)
-            await emit(WorkflowEvent(session_id, "stage", stage_id, "running", progress, name))
+            await emit(
+                WorkflowEvent(
+                    session_id,
+                    "stage",
+                    stage_id,
+                    "running",
+                    progress,
+                    name,
+                    step=step.model_copy(deep=True),
+                )
+            )
             return step
 
         async def finish(
             step: DiagnosticStep, status: StepStatus, progress: int, message: str
         ) -> None:
+            nonlocal active_step
             step.status = status
             step.ended_at = datetime.now(UTC)
+            step.explanation = message
+            step.confidence = (
+                Confidence.INCONCLUSIVE
+                if status in {StepStatus.WARNING, StepStatus.FAILED, StepStatus.INCONCLUSIVE}
+                else Confidence.POSSIBLE
+            )
+            step.recommended_verification = (
+                "Review the evidence references attached to this step."
+                if status not in {StepStatus.FAILED, StepStatus.WARNING}
+                else "Resolve the warning or collection issue, then repeat the affected step."
+            )
+            step.next_action = (
+                "Continue to the next diagnostic step."
+                if status == StepStatus.PASSED
+                else "Review the limitation and decide whether a repeat capture is needed."
+            )
             self.repository.save_step(step)
             await emit(
-                WorkflowEvent(session_id, "stage", step.step_id, status.value, progress, message)
+                WorkflowEvent(
+                    session_id,
+                    "stage",
+                    step.step_id,
+                    status.value,
+                    progress,
+                    message,
+                    step=step.model_copy(deep=True),
+                )
             )
+            if active_step is step:
+                active_step = None
 
         try:
             step = await stage("host_discovery", "Discover host", 5)
@@ -115,6 +167,7 @@ class DiagnosticRunner:
                 },
             )
             self.repository.save_evidence(host_evidence)
+            collected_evidence.append(host_evidence)
             step.evidence_ids = [host_evidence.id]
             await emit(WorkflowEvent(session_id, "evidence", "host_discovery", "completed", 10,
                                       "Host snapshot collected", evidence=host_evidence))
@@ -133,6 +186,7 @@ class DiagnosticRunner:
                 },
             )
             self.repository.save_evidence(route_evidence)
+            collected_evidence.append(route_evidence)
             step.evidence_ids = [route_evidence.id]
             await emit(WorkflowEvent(session_id, "evidence", "route_inspection", "completed", 20,
                                       "Route and listener snapshot collected", evidence=route_evidence))
@@ -208,11 +262,18 @@ class DiagnosticRunner:
                     await asyncio.to_thread(capture_ready.wait, 0.05)
                 if capture_task.done():
                     await capture_task
-                    if not capture_ready.is_set():
+                    if not capture_ready.is_set() and not cancel_event.is_set():
                         raise RuntimeError("Capture backend stopped before it became ready.")
                 packets = ()
                 capture_source = f"live:{interface}"
-            await finish(step, StepStatus.PASSED, 30, f"Capture ready: {capture_source}")
+            await finish(
+                step,
+                StepStatus.WARNING if cancel_event.is_set() and capture_ready and not capture_ready.is_set() else StepStatus.PASSED,
+                30,
+                "Capture cancelled before readiness; partial host evidence was retained."
+                if cancel_event.is_set() and capture_ready and not capture_ready.is_set()
+                else f"Capture ready: {capture_source}",
+            )
 
             tracker = TCPSessionTracker(server_port=config.destination_port)
             step = await stage("packet_observation", "Observe TCP packets", 35)
@@ -277,6 +338,7 @@ class DiagnosticRunner:
                 },
             )
             self.repository.save_evidence(summary)
+            collected_evidence.append(summary)
             step.evidence_ids = [summary.id]
             await emit(WorkflowEvent(session_id, "evidence", "packet_observation", "completed", 85,
                                       "Packet summary collected", evidence=summary))
@@ -293,6 +355,7 @@ class DiagnosticRunner:
             if cancel_event.is_set():
                 raise asyncio.CancelledError
 
+            step = await stage("heartbeat", "Evaluate heartbeat", 88)
             last_packet = tracker.sessions[-1].last_seen if tracker.sessions else None
             heartbeat = evaluate_heartbeat(
                 last_packet,
@@ -310,14 +373,18 @@ class DiagnosticRunner:
                 observation=heartbeat,
             )
             self.repository.save_evidence(heartbeat_evidence)
+            collected_evidence.append(heartbeat_evidence)
+            step.evidence_ids = [heartbeat_evidence.id]
             await emit(WorkflowEvent(session_id, "evidence", "heartbeat", "completed", 88,
                                       f"Heartbeat status: {heartbeat['status']}", evidence=heartbeat_evidence))
+            await finish(step, StepStatus.PASSED, 89, f"Heartbeat status: {heartbeat['status']}")
 
             step = await stage("rca", "Correlate evidence and diagnose", 90)
             findings = analyze(
                 session_id,
-                [host_evidence, route_evidence, summary],
+                collected_evidence,
                 [s.handshake for s in tracker.sessions],
+                tracker.sessions,
             )
             for finding in findings:
                 self.repository.save_finding(finding)
@@ -333,14 +400,38 @@ class DiagnosticRunner:
                     )
                 )
             await finish(step, StepStatus.PASSED, 95, f"Generated {len(findings)} findings")
-            report = self._report_payload(session_id, config, snapshot, tracker.sessions, findings)
+            report = self._report_payload(
+                session_id,
+                config,
+                snapshot,
+                tracker.sessions,
+                findings,
+                steps,
+                collected_evidence,
+            )
             report_dir = Path(self.repository.database_path).parent / "reports"
             report_dir.mkdir(parents=True, exist_ok=True)
             html_path = export_html(
-                report_dir / f"{session_id}.html", "NetPath Sentinel Diagnostic Report", report
+                report_dir / f"{session_id}.html",
+                "NetPath Sentinel Diagnostic Report",
+                report,
+                report_kind="technical",
+            )
+            executive_html_path = export_html(
+                report_dir / f"{session_id}-executive.html",
+                "NetPath Sentinel Executive Summary",
+                report,
+                report_kind="executive",
             )
             json_path = export_json(report_dir / f"{session_id}.json", report)
+            if not html_path.is_file() or html_path.stat().st_size == 0:
+                raise OSError(f"HTML report was not persisted: {html_path}")
+            if not json_path.is_file() or json_path.stat().st_size == 0:
+                raise OSError(f"JSON report was not persisted: {json_path}")
+            if not executive_html_path.is_file() or executive_html_path.stat().st_size == 0:
+                raise OSError(f"Executive report was not persisted: {executive_html_path}")
             self.repository.save_report(session_id, str(html_path), str(json_path))
+            self.repository.save_report(session_id, str(executive_html_path), str(json_path))
             self.repository.update_session_status(session_id, "completed")
             await emit(
                 WorkflowEvent(
@@ -357,6 +448,7 @@ class DiagnosticRunner:
                 "findings": findings,
                 "report": report,
                 "html_report": html_path,
+                "executive_html_report": executive_html_path,
                 "json_report": json_path,
             }
         except asyncio.CancelledError:
@@ -368,6 +460,68 @@ class DiagnosticRunner:
             )
             raise
         except Exception as exc:
+            diagnostics = getattr(exc, "diagnostics", {})
+            if not isinstance(diagnostics, dict):
+                diagnostics = {}
+            failure_evidence = Evidence(
+                session_id=session_id,
+                evidence_type="capture_error",
+                source="capture_backend",
+                status=(
+                    EvidenceStatus.PERMISSION_DENIED
+                    if diagnostics.get("error_category") == "permission_denied"
+                    else EvidenceStatus.COLLECTION_FAILED
+                ),
+                observation={
+                    "error_category": diagnostics.get("error_category", "capture_failed"),
+                    "error": str(exc),
+                    "diagnostics": diagnostics,
+                    "selected_interface": config.interface,
+                    "capture_incomplete": True,
+                },
+            )
+            self.repository.save_evidence(failure_evidence)
+            collected_evidence.append(failure_evidence)
+            if active_step is not None:
+                active_step.status = (
+                    StepStatus.PERMISSION_DENIED
+                    if failure_evidence.status == EvidenceStatus.PERMISSION_DENIED
+                    else StepStatus.FAILED
+                )
+                active_step.ended_at = datetime.now(UTC)
+                active_step.error = str(exc)
+                active_step.explanation = "Capture setup or collection did not complete; no network-health conclusion is supported by this error alone."
+                active_step.confidence = Confidence.INCONCLUSIVE
+                active_step.evidence_ids.append(failure_evidence.id)
+                active_step.recommended_verification = "Review the capture diagnostic category, selected interface, and user permissions."
+                active_step.next_action = "Correct the capture setup and retry with an authorized adapter."
+                self.repository.save_step(active_step)
+                await emit(
+                    WorkflowEvent(
+                        session_id,
+                        "stage",
+                        active_step.step_id,
+                        active_step.status.value,
+                        100,
+                        active_step.explanation,
+                        evidence=failure_evidence,
+                        step=active_step.model_copy(deep=True),
+                    )
+                )
+            if not any(item.evidence_type == "packet_summary" for item in collected_evidence):
+                for finding in analyze(session_id, collected_evidence, []):
+                    self.repository.save_finding(finding)
+                    await emit(
+                        WorkflowEvent(
+                            session_id,
+                            "finding",
+                            "rca",
+                            "completed",
+                            95,
+                            finding.conclusion,
+                            finding=finding,
+                        )
+                    )
             self.repository.update_session_status(session_id, "failed")
             await emit(WorkflowEvent(session_id, "error", "workflow", "failed", 100, str(exc)))
             raise
@@ -438,16 +592,31 @@ class DiagnosticRunner:
         snapshot: HostSnapshot,
         sessions: list[TCPSession],
         findings: list[Finding],
+        steps: list[DiagnosticStep] | None = None,
+        evidence: list[Evidence] | None = None,
     ) -> dict[str, object]:
+        packet_events = [packet for session in sessions for packet in session.packets]
+        retransmissions = sum(session.retransmissions for session in sessions)
         return {
             "session_id": session_id,
             "configuration": config.model_dump(mode="json"),
             "hostname": snapshot.hostname,
             "os": snapshot.os_version,
+            "interfaces": [interface.model_dump(mode="json") for interface in snapshot.interfaces],
             "routes": [route.model_dump(mode="json") for route in snapshot.routes],
             "route_error": snapshot.route_error,
+            "listeners": [listener.model_dump(mode="json") for listener in snapshot.listeners],
             "tcp_sessions": [s.model_dump(mode="json", exclude={"packets"}) for s in sessions],
             "findings": [f.model_dump(mode="json") for f in findings],
+            "steps": [step.model_dump(mode="json") for step in steps or []],
+            "evidence": [item.model_dump(mode="json") for item in evidence or []],
+            "packet_timeline": [packet.model_dump(mode="json") for packet in packet_events],
+            "metrics": {
+                "tcp_sessions": len(sessions),
+                "packets_observed": len(packet_events),
+                "retransmissions": retransmissions,
+                "findings": len(findings),
+            },
             "limitations": [
                 "Packet capture evidence only describes what was observable at this host."
             ],

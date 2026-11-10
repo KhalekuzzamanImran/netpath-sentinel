@@ -1,11 +1,15 @@
 import argparse
 import json
 
+from . import __version__
 from .infrastructure.host import HostInspector
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="netpath-sentinel")
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}"
+    )
     parser.add_argument("command", choices=["inspect-host"], nargs="?", default="inspect-host")
     args = parser.parse_args()
     if args.command == "inspect-host":

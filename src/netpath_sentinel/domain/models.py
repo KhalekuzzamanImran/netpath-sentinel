@@ -104,6 +104,8 @@ class TCPSession(BaseModel):
     stream_incomplete: bool = False
     duplicate_acks: int = 0
     out_of_order_segments: int = 0
+    fin_client_observed: bool = False
+    fin_server_observed: bool = False
 
 
 class Evidence(BaseModel):
@@ -125,9 +127,14 @@ class DiagnosticStep(BaseModel):
     step_id: str
     name: str
     status: StepStatus = StepStatus.PENDING
+    purpose: str = ""
     started_at: datetime | None = None
     ended_at: datetime | None = None
     evidence_ids: list[str] = Field(default_factory=list)
+    explanation: str = ""
+    confidence: Confidence = Confidence.INCONCLUSIVE
+    recommended_verification: str = ""
+    next_action: str = ""
     error: str | None = None
     warnings: list[str] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
@@ -143,5 +150,6 @@ class Finding(BaseModel):
     supporting_evidence_ids: list[str] = Field(default_factory=list)
     contradictory_evidence: list[str] = Field(default_factory=list)
     alternatives: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
     recommended_verification: str
     next_action: str

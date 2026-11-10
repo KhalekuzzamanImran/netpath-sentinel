@@ -1,6 +1,7 @@
 import asyncio
 import ipaddress
 import struct
+from pathlib import Path
 
 import pytest
 
@@ -58,7 +59,16 @@ async def test_replay_runner_streams_packets_persists_findings_and_reports(tmp_p
     assert result["sessions"][0].handshake == "complete"
     assert result["sessions"][0].payload_bytes_client_to_server == 3
     assert (tmp_path / "reports" / "session-1.html").exists()
+    assert (tmp_path / "reports" / "session-1-executive.html").exists()
+    assert result["json_report"].is_file()
     assert len(repository.session_bundle("session-1")["packets"]) == 4
+    reports = repository.session_bundle("session-1")["reports"]
+    assert len(reports) == 2
+    assert {Path(item["html_path"]).name for item in reports} == {
+        "session-1.html",
+        "session-1-executive.html",
+    }
+    assert result["report"]["metrics"]["tcp_sessions"] == 1
 
 
 @pytest.mark.asyncio

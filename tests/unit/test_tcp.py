@@ -59,7 +59,7 @@ def test_stream_reassembly_orders_segments_and_deduplicates() -> None:
     session = tracker.sessions[0]
     assert bytes.fromhex(session.stream_client_to_server) == b"abcd"
     assert session.out_of_order_segments == 1
-    assert session.retransmissions >= 1
+    assert session.retransmissions == 1
 
 
 def test_tracker_does_not_confirm_handshake_with_incorrect_ack_numbers() -> None:
@@ -95,6 +95,55 @@ def test_tracker_marks_midstream_capture() -> None:
     tracker.ingest(packet("A"))
     assert tracker.sessions[0].capture_started_midstream
     assert tracker.sessions[0].handshake == "not_observed_midstream"
+
+
+def test_fin_exchange_keeps_handshake_and_marks_session_closed() -> None:
+    tracker = TCPSessionTracker(server_port=6000)
+    packets = (
+        packet("S").model_copy(update={"sequence": 100}),
+        packet("SA", src_port=6000, dst_port=40000).model_copy(
+            update={"sequence": 200, "acknowledgement": 101}
+        ),
+        packet("A").model_copy(update={"sequence": 101, "acknowledgement": 201}),
+        packet("FA").model_copy(update={"sequence": 101, "acknowledgement": 201}),
+        packet("A", src_port=6000, dst_port=40000).model_copy(
+            update={"sequence": 201, "acknowledgement": 102}
+        ),
+        packet("FA", src_port=6000, dst_port=40000).model_copy(
+            update={"sequence": 201, "acknowledgement": 102}
+        ),
+        packet("A").model_copy(update={"sequence": 102, "acknowledgement": 202}),
+    )
+    for item in packets:
+        session = tracker.ingest(item)
+
+    assert session.handshake == "complete"
+    assert session.observed_state == "closed_observed"
+    assert session.fin_client_observed and session.fin_server_observed
+    assert session.duplicate_acks == 0
+
+
+def test_duplicate_ack_requires_unacknowledged_payload() -> None:
+    tracker = TCPSessionTracker(server_port=6000)
+    tracker.ingest(packet("S").model_copy(update={"sequence": 100}))
+    tracker.ingest(
+        packet("SA", src_port=6000, dst_port=40000).model_copy(
+            update={"sequence": 200, "acknowledgement": 101}
+        )
+    )
+    tracker.ingest(packet("A").model_copy(update={"sequence": 101, "acknowledgement": 201}))
+    tracker.ingest(
+        packet("PA", payload=2).model_copy(
+            update={"sequence": 101, "acknowledgement": 201, "payload_data": b"hi"}
+        )
+    )
+    repeated = packet("A", src_port=6000, dst_port=40000).model_copy(
+        update={"sequence": 201, "acknowledgement": 101}
+    )
+    tracker.ingest(repeated)
+    session = tracker.ingest(repeated)
+
+    assert session.duplicate_acks >= 1
 
 
 def test_heartbeat_disabled_and_overdue() -> None:

@@ -187,14 +187,18 @@ def test_npcap_loopback_events_update_qt_ui_while_capture_is_running(
 
     window = MainWindow()
     qtbot.addWidget(window)
-    combos = window.findChildren(QComboBox)
-    line_edits = window.findChildren(QLineEdit)
-    spinboxes = window.findChildren(QSpinBox)
-    combos[1].setCurrentIndex(combos[1].findData("Loopback Pseudo-Interface 1"))
-    line_edits[0].setText("Npcap Qt live acceptance")
-    spinboxes[0].setValue(port)
-    spinboxes[1].setValue(8)
-    window.pages.setCurrentIndex(1)
+    interface = window.findChild(QComboBox, "captureInterface")
+    session_name = window.findChild(QLineEdit, "diagnosticName")
+    port_box = window.findChild(QSpinBox, "destinationPort")
+    duration_box = window.findChild(QSpinBox, "captureDuration")
+    assert interface is not None and session_name is not None
+    assert port_box is not None and duration_box is not None
+    interface.setCurrentIndex(interface.findData("Loopback Pseudo-Interface 1"))
+    session_name.setText("Npcap Qt live acceptance")
+    port_box.setValue(port)
+    duration_box.setValue(8)
+    window.sidebar.setCurrentRow(1)
+    window.config_wizard.setCurrentIndex(2)
     start = next(button for button in window.findChildren(QPushButton)
                  if button.text() == "Create and start diagnostic")
     start.click()
@@ -232,8 +236,15 @@ def test_npcap_loopback_events_update_qt_ui_while_capture_is_running(
     assert window.session_id is not None
     assert window.repository.session_bundle(window.session_id)["packets"]
     with window.repository.sessions() as db:
-        report = db.query(StoredReport).filter_by(session_id=window.session_id).one()
-    assert Path(report.html_path).is_file()
-    assert Path(report.json_path).is_file()
+        reports = db.query(StoredReport).filter_by(session_id=window.session_id).all()
+    html_paths = [Path(report.html_path) for report in reports]
+    json_paths = [Path(report.json_path) for report in reports]
+    assert len(html_paths) == 2
+    assert all(path.is_file() and path.stat().st_size > 0 for path in html_paths + json_paths)
+    assert any("executive" in path.stem for path in html_paths)
+    assert "phase8-qt-payload" not in " ".join(path.read_text() for path in html_paths + json_paths)
     assert "TCP_HANDSHAKE_COMPLETE" in window.details.findings.toPlainText()
-    qtbot.waitUntil(lambda: not window.worker_thread.isRunning(), timeout=3000)
+    qtbot.waitUntil(
+        lambda: window.worker_thread is None or not window.worker_thread.isRunning(),
+        timeout=3000,
+    )
